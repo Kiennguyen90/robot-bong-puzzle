@@ -1282,6 +1282,10 @@
          - Thanh gợi ý trong trận không hiện nữa (cùng chủ trương với chặn
            showHint/announce trong JS): trên điện thoại không còn thông báo nào
            chèn vào giữa màn chơi làm nhảy hình. */
+      @media (pointer: coarse){
+        /* v6: vuốt trên bàn để điều khiển khối, không cuộn trang */
+        #board-1{ touch-action:none; user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; }
+      }
       @media (pointer: coarse), (max-width: 920px){
         .pad button.spacebtn{ display:none !important; }
         #hint-bar{ display:none !important; }
@@ -5791,6 +5795,7 @@ Scene — reaction to the dragon's Lv3 shield skill: the DRAGON on the LEFT brac
     document.addEventListener('fullscreenchange', syncBoardHeight);
     if(window.visualViewport) window.visualViewport.addEventListener('resize', syncBoardHeight);
     function endGame(winner, reason){
+      try{ stopAllHolds(); }catch(e){}
       if(!running) return;
       running = false;
       cleanupAttackRunners();
@@ -5864,6 +5869,7 @@ Scene — reaction to the dragon's Lv3 shield skill: the DRAGON on the LEFT brac
     function setPaused(v){
       if(!running) return;
       paused = v;
+      if(v){ try{ stopAllHolds(); }catch(e){} }
       $('pause-veil').hidden = !v;
       $('pause-btn').innerHTML = v ? ICON_PLAY : ICON_PAUSE;
       $('pause-btn').title = v ? T('Chơi tiếp') : T('Tạm dừng');
@@ -5871,25 +5877,127 @@ Scene — reaction to the dragon's Lv3 shield skill: the DRAGON on the LEFT brac
     }
 
     /* ================= Điều khiển ================= */
+    /* v6 — điều khiển cảm ứng:
+       - Giữ ◀ / ▶: đi 1 ô ngay, sau TOUCH_DAS ms tự lặp mỗi TOUCH_ARR ms (như giữ phím mũi tên).
+       - Nút ⬇: chạm nhanh = thả rơi ngay (như cũ); giữ quá TOUCH_HOLD ms = rơi nhanh
+         (như giữ phím ↓) cho tới khi nhấc tay.
+       - Vuốt trên mặt bàn (chỉ cảm ứng): kéo ngang = đi theo từng ô, kéo xuống chậm
+         = rơi nhanh, vuốt xuống mạnh = thả rơi ngay, chạm = xoay. */
+    const TOUCH_DAS = 170, TOUCH_ARR = 55, TOUCH_HOLD = 170;
+    const padHolds = new Set();   // các nút đang giữ: { stop() }
+    function stopAllHolds(){ padHolds.forEach(h => h.stop()); padHolds.clear(); }
+    function canControl(p){ return !!(p && !p.remote && running && !paused); }
     function bindPad(padEl, getPlayer){
       padEl.querySelectorAll('button').forEach(btn => {
         const act = btn.dataset.act;
+        let hold = null;
+        const release = (fire) => {
+          if(!hold) return;
+          const h = hold; hold = null;
+          h.stop(fire);
+          padHolds.delete(h);
+        };
         btn.addEventListener('pointerdown', e => {
           e.preventDefault();
           const p = getPlayer();
-          if(!p || p.remote || !running || paused) return;
-          if(act === 'left'){ if(tryMove(p, -1, 0)) sfx.move(); }
-          if(act === 'right'){ if(tryMove(p, 1, 0)) sfx.move(); }
-          if(act === 'rotate') tryRotate(p);
-          if(act === 'drop') hardDrop(p);
-          if(act === 'space') hardDrop(p);
-          if(act && act.indexOf('slot') === 0) deploySlot(p, parseInt(act.slice(4), 10));
+          if(!canControl(p)) return;
+          if(act === 'left' || act === 'right'){
+            const dx = act === 'left' ? -1 : 1;
+            release(false);
+            if(tryMove(p, dx, 0)) sfx.move();
+            let rep = null;
+            const das = setTimeout(() => {
+              rep = setInterval(() => {
+                const q = getPlayer();
+                if(!canControl(q)){ release(false); return; }
+                if(tryMove(q, dx, 0)) sfx.move();
+              }, TOUCH_ARR);
+            }, TOUCH_DAS);
+            hold = { stop(){ clearTimeout(das); if(rep) clearInterval(rep); } };
+          }
+          else if(act === 'drop'){
+            release(false);
+            let soft = false, keep = null;
+            const t = setTimeout(() => {
+              soft = true;
+              const q = getPlayer();
+              if(!canControl(q)) return;
+              q.fastDrop = true;
+              /* khóa khối xong thì fastDrop bị tắt: giữ tay thì bật lại cho khối kế */
+              keep = setInterval(() => { const r = getPlayer(); if(canControl(r)) r.fastDrop = true; }, 50);
+            }, TOUCH_HOLD);
+            hold = { stop(fire){
+              clearTimeout(t); if(keep) clearInterval(keep);
+              const q = getPlayer();
+              if(soft){ if(q) q.fastDrop = false; }
+              else if(fire && canControl(q)) hardDrop(q);
+            } };
+          }
+          else {
+            if(act === 'rotate') tryRotate(p);
+            if(act === 'space') hardDrop(p);
+            if(act && act.indexOf('slot') === 0) deploySlot(p, parseInt(act.slice(4), 10));
+            return;
+          }
+          padHolds.add(hold);
+          try{ btn.setPointerCapture(e.pointerId); }catch(err){}
         });
+        btn.addEventListener('pointerup', () => release(true));
+        btn.addEventListener('pointercancel', () => release(false));
+        btn.addEventListener('lostpointercapture', () => release(false));
+        btn.addEventListener('contextmenu', e => e.preventDefault());
       });
+    }
+    function bindBoardSwipe(cv, getPlayer){
+      if(!cv) return;
+      let g = null;
+      const endSwipe = (fire) => {
+        if(!g) return;
+        const st = g; g = null;
+        const p = getPlayer();
+        if(st.soft && p) p.fastDrop = false;
+        if(!fire || !canControl(p)) return;
+        const dt = performance.now() - st.t0;
+        const dy = st.lastY - st.y0;
+        const cell = st.cell;
+        if(!st.moved && !st.soft && dt < 300 && Math.abs(dy) < cell * .5) tryRotate(p);
+        else if(!st.soft && dy > cell * 1.5 && dy / Math.max(dt, 1) > .9) hardDrop(p);   // vuốt xuống mạnh
+      };
+      cv.addEventListener('pointerdown', e => {
+        if(e.pointerType !== 'touch') return;
+        const p = getPlayer();
+        if(!canControl(p)) return;
+        e.preventDefault();
+        const r = cv.getBoundingClientRect();
+        g = { id:e.pointerId, x0:e.clientX, y0:e.clientY, ax:e.clientX, lastY:e.clientY,
+              t0:performance.now(), cell:Math.max(12, r.width / COLS), moved:false, soft:false };
+        try{ cv.setPointerCapture(e.pointerId); }catch(err){}
+      });
+      cv.addEventListener('pointermove', e => {
+        if(!g || e.pointerId !== g.id) return;
+        const p = getPlayer();
+        if(!canControl(p)){ endSwipe(false); return; }
+        e.preventDefault();
+        g.lastY = e.clientY;
+        /* ngang: mỗi lần kéo đủ 1 ô thì đi 1 ô */
+        while(e.clientX - g.ax >= g.cell){ g.ax += g.cell; g.moved = true; if(tryMove(p, 1, 0)) sfx.move(); }
+        while(g.ax - e.clientX >= g.cell){ g.ax -= g.cell; g.moved = true; if(tryMove(p, -1, 0)) sfx.move(); }
+        /* dọc: kéo xuống chậm quá 1 ô = rơi nhanh khi còn giữ tay */
+        const dy = e.clientY - g.y0, dt = performance.now() - g.t0;
+        if(!g.soft && dy > g.cell && dy / Math.max(dt, 1) <= .9 && Math.abs(dy) > Math.abs(e.clientX - g.x0)){
+          g.soft = true; g.moved = true;
+        }
+        if(g.soft) p.fastDrop = true;
+      });
+      cv.addEventListener('pointerup', e => { if(g && e.pointerId === g.id) endSwipe(true); });
+      cv.addEventListener('pointercancel', () => endSwipe(false));
     }
     bindPad($('pad-1'), () => mode === 'online' ? myPlayer() : P1);
     /* Số 1–5 từ v81 nằm ở hàng "Tiếp" (#deploybar), ngoài #pad-1: nối bấm riêng cho hàng đó */
     if($('deploybar')) bindPad($('deploybar'), () => mode === 'online' ? myPlayer() : P1);
+    bindBoardSwipe($('board-1'), () => mode === 'online' ? myPlayer() : P1);
+    window.addEventListener('blur', stopAllHolds);
+    document.addEventListener('visibilitychange', () => { if(document.hidden) stopAllHolds(); });
 
     function controlKey(p, code, repeat){
       // trả về true nếu phím thuộc bộ điều khiển của người chơi
